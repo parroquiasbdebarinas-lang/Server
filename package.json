@@ -1,0 +1,16 @@
+{
+  "name": "radio-santa-barbara-server",
+  "version": "1.0.0",
+  "description": "Servidor de Radio Santa Bárbara",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.5.4"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
