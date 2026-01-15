@@ -9,22 +9,20 @@ const { Pool } = require('pg'); // CAMBIO: Usamos pg en lugar de mongoose
 // Configuración de CORS para permitir que Vercel se conecte a este servidor
 const io = new Server(server, {
     cors: {
-        origin: "*", // Permitir conexión desde cualquier URL
+        origin: "*", // Permitir conexión desde cualquier URL (por seguridad, luego puedes poner solo tu dominio de Vercel)
         methods: ["GET", "POST"]
     }
 });
 
-// --- CONEXIÓN A POSTGRESQL (Render Internal) ---
-// Usamos la variable de entorno o la URL interna que me pasaste por defecto
+// --- CONEXIÓN A POSTGRESQL (Render) ---
 const connectionString = process.env.DATABASE_URL || 'postgresql://admin:EKGyO0iMTE2b4aWfHypj237Ms6Gk5FbC@dpg-d5k382mr433s73ehm0b0-a/radiodb_2bfj';
 
 const pool = new Pool({
     connectionString: connectionString,
-    ssl: { rejectUnauthorized: false } // Requerido por Render
+    ssl: { rejectUnauthorized: false }
 });
 
-// --- INICIALIZACIÓN DE TABLAS (Equivalente a tus SCHEMAS de Mongoose) ---
-// Creamos las tablas si no existen, respetando la estructura que tenías
+// --- INICIALIZACIÓN DE TABLAS (Equivalente a tus MODELOS de Mongoose) ---
 const initDB = async () => {
     try {
         await pool.query(`
@@ -61,7 +59,7 @@ const initDB = async () => {
 };
 initDB();
 
-// --- FILTRO DE PALABRAS (INTACTO - NO TOCADO) ---
+// --- FILTRO DE PALABRAS (Extenso - Latam/España/USA) ---
 const badWords = [
     "puta", "puto", "mierda", "verga", "pendejo", "estupido", "idiota", "imbecil",
     "cabron", "marico", "marica", "zorra", "mamaguevo", "coño", "joder", "carajo",
@@ -92,7 +90,7 @@ app.get('/', (req, res) => {
     res.send('Backend de Radio Santa Bárbara: ACTIVO');
 });
 
-// Función auxiliar para desconectar inmediatamente a un usuario por IP (INTACTA)
+// Función auxiliar para desconectar inmediatamente a un usuario por IP
 function disconnectUserByIp(ip, reason) {
     const connectedSockets = io.sockets.sockets; // Map de sockets conectados
     connectedSockets.forEach((socket) => {
@@ -109,7 +107,7 @@ io.on('connection', async (socket) => {
     // Obtener IP del cliente (compatible con Render/Vercel y Localhost)
     const clientIp = socket.handshake.headers['x-forwarded-for'] ? socket.handshake.headers['x-forwarded-for'].split(',')[0] : socket.handshake.address;
 
-    // 1. Verificar Baneo Permanente (Adaptado a PG)
+    // 1. Verificar Baneo Permanente
     const bannedRes = await pool.query('SELECT * FROM banned_users WHERE ip = $1', [clientIp]);
     if (bannedRes.rows.length > 0) {
         socket.emit('banned', 'Has sido baneado permanentemente.'); 
@@ -117,13 +115,11 @@ io.on('connection', async (socket) => {
         return;
     }
 
-    // 2. Verificar Baneo Temporal (Adaptado a PG)
+    // 2. Verificar Baneo Temporal
     const tempBanRes = await pool.query('SELECT * FROM temp_bans WHERE ip = $1', [clientIp]);
     if (tempBanRes.rows.length > 0) {
         const tempBan = tempBanRes.rows[0];
-        // Nota: Postgres devuelve los BIGINT como strings, hay que convertir
-        const expiration = parseInt(tempBan.expiration);
-        
+        const expiration = Number(tempBan.expiration);
         if (Date.now() < expiration) {
             const remainingMinutes = Math.ceil((expiration - Date.now()) / 60000);
             socket.emit('banned', `Suspendido temporalmente. Tiempo restante: ${remainingMinutes} minutos.`);
@@ -139,16 +135,14 @@ io.on('connection', async (socket) => {
     io.emit('user count', connectedUsers); // Avisar a todos cuántos hay
 
     // 1. Enviar SOLO los últimos 50 mensajes al entrar
-    // Obtenemos los últimos 50 mensajes ordenados por fecha DESC, luego invertimos
     const recentRes = await pool.query('SELECT * FROM messages ORDER BY timestamp DESC LIMIT 50');
-    // Mapeamos para mantener la estructura de objetos JS que tenías
     const sortedMessages = recentRes.rows.reverse().map(row => ({
         id: row.id,
         user: row.user,
         text: row.text,
         ip: row.ip,
         isSystem: row.isSystem,
-        timestamp: parseInt(row.timestamp)
+        timestamp: Number(row.timestamp)
     }));
 
     // Importante: No enviar la IP a los usuarios normales por seguridad
@@ -163,7 +157,7 @@ io.on('connection', async (socket) => {
     socket.on('request full history', async () => {
         const allRes = await pool.query('SELECT * FROM messages ORDER BY timestamp ASC');
         const allMessages = allRes.rows.map(row => ({
-            id: row.id, user: row.user, text: row.text, ip: row.ip, isSystem: row.isSystem, timestamp: parseInt(row.timestamp)
+            id: row.id, user: row.user, text: row.text, ip: row.ip, isSystem: row.isSystem, timestamp: Number(row.timestamp)
         }));
         socket.emit('full history', allMessages);
     });
@@ -172,7 +166,7 @@ io.on('connection', async (socket) => {
     socket.on('admin request reports', async () => {
         const reportsRes = await pool.query('SELECT * FROM reports ORDER BY timestamp DESC');
         const reports = reportsRes.rows.map(row => ({
-            id: row.id, reportedMsg: row.reportedMsg, reason: row.reason, reporterIp: row.reporterIp, timestamp: parseInt(row.timestamp)
+            id: row.id, reportedMsg: row.reportedMsg, reason: row.reason, reporterIp: row.reporterIp, timestamp: Number(row.timestamp)
         }));
         socket.emit('all reports', reports);
     });
@@ -188,15 +182,12 @@ io.on('connection', async (socket) => {
         }
         
         const tempBanNow = await pool.query('SELECT * FROM temp_bans WHERE ip = $1', [clientIp]);
-        if (tempBanNow.rows.length > 0) {
-             const expiration = parseInt(tempBanNow.rows[0].expiration);
-             if (Date.now() < expiration) {
-                socket.disconnect();
-                return;
-             }
+        if (tempBanNow.rows.length > 0 && Date.now() < Number(tempBanNow.rows[0].expiration)) {
+            socket.disconnect();
+            return;
         }
 
-        // 3. FILTRADO DE PALABRAS (Tu lógica original)
+        // 3. FILTRADO DE PALABRAS
         let cleanText = msg.text;
         
         // Usar el filtro avanzado (Regex generado arriba)
@@ -207,16 +198,15 @@ io.on('connection', async (socket) => {
         // Actualizar el texto del mensaje con la versión limpia
         msg.text = cleanText;
         
-        // Asignar un ID único al mensaje
+        // Asignar un ID único al mensaje (necesario para borrarlo individualmente)
         msg.id = Date.now().toString() + Math.random().toString(36).substr(2, 9);
         msg.timestamp = Date.now(); // Guardar la hora exacta
-        msg.ip = clientIp; // Guardar la IP
-        const isSystem = msg.isSystem || false;
+        msg.ip = clientIp; // Guardar la IP (para poder banearlo luego)
 
-        // 4. Guardar el mensaje en el historial (INSERT SQL)
+        // 4. Guardar el mensaje en el historial (SQL)
         await pool.query(
             'INSERT INTO messages (id, "user", text, ip, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
-            [msg.id, msg.user, msg.text, msg.ip, isSystem, msg.timestamp]
+            [msg.id, msg.user, msg.text, msg.ip, msg.isSystem || false, msg.timestamp]
         );
 
         // Reenviarlo a TODOS los conectados
@@ -228,7 +218,7 @@ io.on('connection', async (socket) => {
     
     // Borrar todo el chat
     socket.on('admin clear chat', async () => {
-        await pool.query('DELETE FROM messages'); // Borrar todos
+        await pool.query('DELETE FROM messages');
         io.emit('chat cleared'); // Avisar a todos
     });
 
@@ -247,25 +237,17 @@ io.on('connection', async (socket) => {
         const msgRes = await pool.query('SELECT * FROM messages WHERE id = $1', [msgId]);
         if (msgRes.rows.length > 0) {
             const msg = msgRes.rows[0];
-            const ipToBan = msg.ip;
-
-            const alreadyBanned = await pool.query('SELECT * FROM banned_users WHERE ip = $1', [ipToBan]);
+            const alreadyBanned = await pool.query('SELECT * FROM banned_users WHERE ip = $1', [msg.ip]);
             if (alreadyBanned.rows.length === 0) {
-                
-                await pool.query('INSERT INTO banned_users (ip, reason, timestamp) VALUES ($1, $2, $3)', [ipToBan, reason, Date.now()]);
-                console.log(`IP Baneada: ${ipToBan} (Usuario: ${msg.user})`);
+                await pool.query('INSERT INTO banned_users (ip, reason, timestamp) VALUES ($1, $2, $3)', [msg.ip, reason, Date.now()]);
+                console.log(`IP Baneada: ${msg.ip} (Usuario: ${msg.user})`);
                 
                 // Desconectar inmediatamente
-                disconnectUserByIp(ipToBan, 'Has sido baneado permanentemente. Razón: ' + reason);
+                disconnectUserByIp(msg.ip, 'Has sido baneado permanentemente. Razón: ' + reason);
 
                 // Avisar en el chat
                 const sysMsgData = { id: Date.now().toString(), user: 'SISTEMA', text: `El usuario ${msg.user} ha sido bloqueado. Razón: ${reason}`, isSystem: true, timestamp: Date.now() };
-                
-                await pool.query(
-                    'INSERT INTO messages (id, "user", text, ip, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
-                    [sysMsgData.id, sysMsgData.user, sysMsgData.text, null, true, sysMsgData.timestamp]
-                );
-                
+                await pool.query('INSERT INTO messages (id, "user", text, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5)', [sysMsgData.id, sysMsgData.user, sysMsgData.text, true, sysMsgData.timestamp]);
                 io.emit('chat message', sysMsgData);
             }
         }
@@ -274,8 +256,8 @@ io.on('connection', async (socket) => {
     // Baneo Temporal (Actualizado para soportar Segundos/Minutos/Horas)
     socket.on('admin temp ban', async (data) => {
         // data espera: { msgId, time, unit, reason }
+        // unit puede ser: 'seconds', 'minutes', 'hours'
         const msgRes = await pool.query('SELECT * FROM messages WHERE id = $1', [data.msgId]);
-        
         if (msgRes.rows.length > 0) {
             const msg = msgRes.rows[0];
             let duration = 0;
@@ -287,12 +269,10 @@ io.on('connection', async (socket) => {
 
             const expiration = Date.now() + duration;
 
-            // Upsert (Insertar o Actualizar si existe)
             await pool.query(`
                 INSERT INTO temp_bans (ip, reason, expiration) 
-                VALUES ($1, $2, $3)
-                ON CONFLICT (ip) 
-                DO UPDATE SET expiration = $3, reason = $2
+                VALUES ($1, $2, $3) 
+                ON CONFLICT (ip) DO UPDATE SET expiration = $3, reason = $2
             `, [msg.ip, data.reason, expiration]);
             
             // Desconectar inmediatamente
@@ -306,12 +286,7 @@ io.on('connection', async (socket) => {
                 isSystem: true, 
                 timestamp: Date.now() 
             };
-            
-            await pool.query(
-                'INSERT INTO messages (id, "user", text, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5)',
-                [sysMsgData.id, sysMsgData.user, sysMsgData.text, true, sysMsgData.timestamp]
-            );
-
+            await pool.query('INSERT INTO messages (id, "user", text, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5)', [sysMsgData.id, sysMsgData.user, sysMsgData.text, true, sysMsgData.timestamp]);
             io.emit('chat message', sysMsgData);
         }
     });
@@ -322,24 +297,15 @@ io.on('connection', async (socket) => {
         const msgRes = await pool.query('SELECT * FROM messages WHERE id = $1', [data.id]);
         if (msgRes.rows.length > 0) {
             const msg = msgRes.rows[0];
-            // Reconstruimos el objeto mensaje para guardarlo en el JSON
-            const msgObj = {
-                id: msg.id, user: msg.user, text: msg.text, ip: msg.ip, isSystem: msg.isSystem, timestamp: parseInt(msg.timestamp)
-            };
-
             const report = {
                 id: Date.now().toString(),
-                reportedMsg: msgObj,
+                reportedMsg: msg,
                 reason: data.reason,
                 timestamp: Date.now(),
                 reporterIp: clientIp
             };
-            
-            await pool.query(
-                'INSERT INTO reports (id, "reportedMsg", reason, "reporterIp", timestamp) VALUES ($1, $2, $3, $4, $5)',
-                [report.id, report.reportedMsg, report.reason, report.reporterIp, report.timestamp]
-            );
-
+            await pool.query('INSERT INTO reports (id, "reportedMsg", reason, "reporterIp", timestamp) VALUES ($1, $2, $3, $4, $5)', 
+                [report.id, JSON.stringify(report.reportedMsg), report.reason, report.reporterIp, report.timestamp]);
             io.emit('new report', report); // Enviar alerta a los admins conectados
         }
     });
@@ -353,12 +319,7 @@ io.on('connection', async (socket) => {
             isSystem: true, // Marca especial para estilos
             timestamp: Date.now()
         };
-        
-        await pool.query(
-            'INSERT INTO messages (id, "user", text, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5)',
-            [msg.id, msg.user, msg.text, true, msg.timestamp]
-        );
-        
+        await pool.query('INSERT INTO messages (id, "user", text, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5)', [msg.id, msg.user, msg.text, true, msg.timestamp]);
         io.emit('chat message', msg);
     });
 
