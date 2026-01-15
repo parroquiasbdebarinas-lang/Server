@@ -1,23 +1,67 @@
+require('dotenv').config(); // Cargar variables de entorno
 const express = require('express');
 const app = express();
 const http = require('http');
 const server = http.createServer(app);
 const { Server } = require("socket.io");
-const fs = require('fs'); // Necesario para guardar archivos
+const { Pool } = require('pg'); // CAMBIO: Usamos pg en lugar de mongoose
 
 // Configuración de CORS para permitir que Vercel se conecte a este servidor
 const io = new Server(server, {
     cors: {
-        origin: "*", // Permitir conexión desde cualquier URL (por seguridad, luego puedes poner solo tu dominio de Vercel)
+        origin: "*", // Permitir conexión desde cualquier URL
         methods: ["GET", "POST"]
     }
 });
-const path = require('path');
-const DATA_FILE = path.join(__dirname, 'chat_history.json'); // Archivo donde se guardarán los mensajes
-const BANNED_FILE = path.join(__dirname, 'banned_ips.json'); // Archivo de IPs baneadas
-const TEMP_BANS_FILE = path.join(__dirname, 'temp_bans.json'); // Archivo de Baneos Temporales
 
-// --- FILTRO DE PALABRAS (Extenso - Latam/España/USA) ---
+// --- CONEXIÓN A POSTGRESQL (Render Internal) ---
+// Usamos la variable de entorno o la URL interna que me pasaste por defecto
+const connectionString = process.env.DATABASE_URL || 'postgresql://admin:EKGyO0iMTE2b4aWfHypj237Ms6Gk5FbC@dpg-d5k382mr433s73ehm0b0-a/radiodb_2bfj';
+
+const pool = new Pool({
+    connectionString: connectionString,
+    ssl: { rejectUnauthorized: false } // Requerido por Render
+});
+
+// --- INICIALIZACIÓN DE TABLAS (Equivalente a tus SCHEMAS de Mongoose) ---
+// Creamos las tablas si no existen, respetando la estructura que tenías
+const initDB = async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                "user" TEXT, 
+                text TEXT,
+                ip TEXT,
+                "isSystem" BOOLEAN,
+                timestamp BIGINT
+            );
+            CREATE TABLE IF NOT EXISTS banned_users (
+                ip TEXT PRIMARY KEY,
+                reason TEXT,
+                timestamp BIGINT
+            );
+            CREATE TABLE IF NOT EXISTS temp_bans (
+                ip TEXT PRIMARY KEY,
+                reason TEXT,
+                expiration BIGINT
+            );
+            CREATE TABLE IF NOT EXISTS reports (
+                id TEXT PRIMARY KEY,
+                "reportedMsg" JSONB,
+                reason TEXT,
+                "reporterIp" TEXT,
+                timestamp BIGINT
+            );
+        `);
+        console.log('✅ Conectado a PostgreSQL y tablas verificadas');
+    } catch (err) {
+        console.error('❌ Error inicializando PostgreSQL:', err);
+    }
+};
+initDB();
+
+// --- FILTRO DE PALABRAS (INTACTO - NO TOCADO) ---
 const badWords = [
     "puta", "puto", "mierda", "verga", "pendejo", "estupido", "idiota", "imbecil",
     "cabron", "marico", "marica", "zorra", "mamaguevo", "coño", "joder", "carajo",
@@ -41,58 +85,14 @@ const badWordsRegex = badWords.map(word => {
     return new RegExp(`\\b${pattern}\\b`, 'gi');
 });
 
-// Array para guardar el historial de mensajes (en memoria)
-const chatHistory = [];
-const MAX_HISTORY = 500; // Guardamos hasta 500 mensajes en memoria
 let connectedUsers = 0; // Contador de usuarios conectados
-const bannedIPs = []; // Lista de IPs baneadas en memoria
-const tempBans = {}; // Mapa de IPs baneadas temporalmente { ip: timestamp_expiracion }
-const reports = []; // Lista de reportes en memoria
-
-// --- PERSISTENCIA: Cargar historial al iniciar ---
-if (fs.existsSync(DATA_FILE)) {
-    try {
-        const data = fs.readFileSync(DATA_FILE, 'utf8');
-        const loaded = JSON.parse(data);
-        if (Array.isArray(loaded)) {
-            chatHistory.push(...loaded);
-            console.log(`Historial cargado: ${chatHistory.length} mensajes.`);
-        }
-    } catch (e) {
-        console.error("Error cargando historial:", e);
-    }
-}
-function saveHistory() {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(chatHistory, null, 2));
-}
-// Cargar IPs baneadas
-if (fs.existsSync(BANNED_FILE)) {
-    try {
-        const data = fs.readFileSync(BANNED_FILE, 'utf8');
-        const loaded = JSON.parse(data);
-        if (Array.isArray(loaded)) bannedIPs.push(...loaded);
-    } catch (e) { console.error("Error cargando bans:", e); }
-}
-function saveBanned() {
-    fs.writeFileSync(BANNED_FILE, JSON.stringify(bannedIPs, null, 2));
-}
-// Cargar Baneos Temporales
-if (fs.existsSync(TEMP_BANS_FILE)) {
-    try {
-        const data = fs.readFileSync(TEMP_BANS_FILE, 'utf8');
-        Object.assign(tempBans, JSON.parse(data));
-    } catch (e) { console.error("Error cargando temp bans:", e); }
-}
-function saveTempBans() {
-    fs.writeFileSync(TEMP_BANS_FILE, JSON.stringify(tempBans, null, 2));
-}
 
 // Ruta por defecto para verificar que el backend está funcionando
 app.get('/', (req, res) => {
     res.send('Backend de Radio Santa Bárbara: ACTIVO');
 });
 
-// Función auxiliar para desconectar inmediatamente a un usuario por IP
+// Función auxiliar para desconectar inmediatamente a un usuario por IP (INTACTA)
 function disconnectUserByIp(ip, reason) {
     const connectedSockets = io.sockets.sockets; // Map de sockets conectados
     connectedSockets.forEach((socket) => {
@@ -105,27 +105,32 @@ function disconnectUserByIp(ip, reason) {
 }
 
 // Lógica de conexión del Chat
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
     // Obtener IP del cliente (compatible con Render/Vercel y Localhost)
     const clientIp = socket.handshake.headers['x-forwarded-for'] ? socket.handshake.headers['x-forwarded-for'].split(',')[0] : socket.handshake.address;
 
-    // 1. Verificar Baneo Permanente
-    if (bannedIPs.includes(clientIp)) {
+    // 1. Verificar Baneo Permanente (Adaptado a PG)
+    const bannedRes = await pool.query('SELECT * FROM banned_users WHERE ip = $1', [clientIp]);
+    if (bannedRes.rows.length > 0) {
         socket.emit('banned', 'Has sido baneado permanentemente.'); 
         socket.disconnect(); // Desconectar
         return;
     }
 
-    // 2. Verificar Baneo Temporal
-    if (tempBans[clientIp]) {
-        if (Date.now() < tempBans[clientIp]) {
-            const remainingMinutes = Math.ceil((tempBans[clientIp] - Date.now()) / 60000);
+    // 2. Verificar Baneo Temporal (Adaptado a PG)
+    const tempBanRes = await pool.query('SELECT * FROM temp_bans WHERE ip = $1', [clientIp]);
+    if (tempBanRes.rows.length > 0) {
+        const tempBan = tempBanRes.rows[0];
+        // Nota: Postgres devuelve los BIGINT como strings, hay que convertir
+        const expiration = parseInt(tempBan.expiration);
+        
+        if (Date.now() < expiration) {
+            const remainingMinutes = Math.ceil((expiration - Date.now()) / 60000);
             socket.emit('banned', `Suspendido temporalmente. Tiempo restante: ${remainingMinutes} minutos.`);
             socket.disconnect();
             return;
         } else {
-            delete tempBans[clientIp]; // El tiempo ya pasó, borrar baneo
-            saveTempBans();
+            await pool.query('DELETE FROM temp_bans WHERE ip = $1', [clientIp]); // El tiempo ya pasó, borrar baneo
         }
     }
 
@@ -134,46 +139,64 @@ io.on('connection', (socket) => {
     io.emit('user count', connectedUsers); // Avisar a todos cuántos hay
 
     // 1. Enviar SOLO los últimos 50 mensajes al entrar
-    const recentMessages = chatHistory.slice(-50);
+    // Obtenemos los últimos 50 mensajes ordenados por fecha DESC, luego invertimos
+    const recentRes = await pool.query('SELECT * FROM messages ORDER BY timestamp DESC LIMIT 50');
+    // Mapeamos para mantener la estructura de objetos JS que tenías
+    const sortedMessages = recentRes.rows.reverse().map(row => ({
+        id: row.id,
+        user: row.user,
+        text: row.text,
+        ip: row.ip,
+        isSystem: row.isSystem,
+        timestamp: parseInt(row.timestamp)
+    }));
+
     // Importante: No enviar la IP a los usuarios normales por seguridad
-    const sanitizedRecent = recentMessages.map(m => ({ ...m, ip: undefined }));
+    const sanitizedRecent = sortedMessages.map(m => ({ ...m, ip: undefined }));
     
     socket.emit('recent history', {
         messages: sanitizedRecent,
-        hasMore: chatHistory.length > 50 // Avisar si hay más mensajes antiguos
+        hasMore: true // Siempre asumimos que puede haber más en DB
     });
 
     // 2. Escuchar petición de "Cargar mensajes antiguos"
-    socket.on('request full history', () => {
-        socket.emit('full history', chatHistory);
+    socket.on('request full history', async () => {
+        const allRes = await pool.query('SELECT * FROM messages ORDER BY timestamp ASC');
+        const allMessages = allRes.rows.map(row => ({
+            id: row.id, user: row.user, text: row.text, ip: row.ip, isSystem: row.isSystem, timestamp: parseInt(row.timestamp)
+        }));
+        socket.emit('full history', allMessages);
     });
 
     // 3. Enviar reportes al admin cuando se conecta (o lo pide)
-    socket.on('admin request reports', () => {
+    socket.on('admin request reports', async () => {
+        const reportsRes = await pool.query('SELECT * FROM reports ORDER BY timestamp DESC');
+        const reports = reportsRes.rows.map(row => ({
+            id: row.id, reportedMsg: row.reportedMsg, reason: row.reason, reporterIp: row.reporterIp, timestamp: parseInt(row.timestamp)
+        }));
         socket.emit('all reports', reports);
     });
 
     // Cuando alguien envía un mensaje
-    socket.on('chat message', (msg) => {
+    socket.on('chat message', async (msg) => {
         // --- SEGURIDAD: VERIFICAR BANEO ANTES DE PROCESAR ---
-        if (bannedIPs.includes(clientIp)) {
+        const isBannedNow = await pool.query('SELECT * FROM banned_users WHERE ip = $1', [clientIp]);
+        if (isBannedNow.rows.length > 0) {
             socket.emit('banned', 'Has sido baneado permanentemente.');
             socket.disconnect();
             return;
         }
-        if (tempBans[clientIp]) {
-            if (Date.now() < tempBans[clientIp]) {
-                const remainingMinutes = Math.ceil((tempBans[clientIp] - Date.now()) / 60000);
-                socket.emit('banned', `Suspendido temporalmente. Tiempo restante: ${remainingMinutes} minutos.`);
+        
+        const tempBanNow = await pool.query('SELECT * FROM temp_bans WHERE ip = $1', [clientIp]);
+        if (tempBanNow.rows.length > 0) {
+             const expiration = parseInt(tempBanNow.rows[0].expiration);
+             if (Date.now() < expiration) {
                 socket.disconnect();
                 return;
-            } else {
-                delete tempBans[clientIp];
-                saveTempBans();
-            }
+             }
         }
 
-        // 3. FILTRADO DE PALABRAS
+        // 3. FILTRADO DE PALABRAS (Tu lógica original)
         let cleanText = msg.text;
         
         // Usar el filtro avanzado (Regex generado arriba)
@@ -184,19 +207,17 @@ io.on('connection', (socket) => {
         // Actualizar el texto del mensaje con la versión limpia
         msg.text = cleanText;
         
-        // Asignar un ID único al mensaje (necesario para borrarlo individualmente)
+        // Asignar un ID único al mensaje
         msg.id = Date.now().toString() + Math.random().toString(36).substr(2, 9);
         msg.timestamp = Date.now(); // Guardar la hora exacta
-        msg.ip = clientIp; // Guardar la IP (para poder banearlo luego)
+        msg.ip = clientIp; // Guardar la IP
+        const isSystem = msg.isSystem || false;
 
-        // 4. Guardar el mensaje en el historial
-        chatHistory.push(msg);
-        saveHistory(); // Guardar en archivo
-
-        // Mantener solo los últimos 500 mensajes para no llenar la memoria de Render
-        if (chatHistory.length > MAX_HISTORY) {
-            chatHistory.shift();
-        }
+        // 4. Guardar el mensaje en el historial (INSERT SQL)
+        await pool.query(
+            'INSERT INTO messages (id, "user", text, ip, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
+            [msg.id, msg.user, msg.text, msg.ip, isSystem, msg.timestamp]
+        );
 
         // Reenviarlo a TODOS los conectados
         // Enviamos una copia SIN la IP para proteger la privacidad
@@ -206,51 +227,57 @@ io.on('connection', (socket) => {
     // --- EVENTOS DE ADMINISTRADOR ---
     
     // Borrar todo el chat
-    socket.on('admin clear chat', () => {
-        chatHistory.length = 0; // Vaciar historial
-        saveHistory(); // Guardar cambios
+    socket.on('admin clear chat', async () => {
+        await pool.query('DELETE FROM messages'); // Borrar todos
         io.emit('chat cleared'); // Avisar a todos
     });
 
     // Borrar mensaje individual
-    socket.on('admin delete message', (id) => {
-        const index = chatHistory.findIndex(m => m.id === id);
-        if (index !== -1) {
-            chatHistory.splice(index, 1); // Borrar del historial
-            saveHistory(); // Guardar cambios
-            io.emit('message deleted', id); // Avisar a todos para que lo quiten de su pantalla
-        }
+    socket.on('admin delete message', async (id) => {
+        await pool.query('DELETE FROM messages WHERE id = $1', [id]);
+        io.emit('message deleted', id); // Avisar a todos
     });
 
     // Banear usuario por ID de mensaje
-    socket.on('admin ban user', (data) => {
+    socket.on('admin ban user', async (data) => {
         // Soporta recibir solo ID (string) o objeto { msgId, reason }
         const msgId = typeof data === 'object' ? data.msgId : data;
         const reason = typeof data === 'object' ? data.reason : 'Comportamiento inadecuado';
 
-        const msg = chatHistory.find(m => m.id === msgId);
-        if (msg && msg.ip) {
-            if (!bannedIPs.includes(msg.ip)) {
-                bannedIPs.push(msg.ip);
-                saveBanned();
-                console.log(`IP Baneada: ${msg.ip} (Usuario: ${msg.user})`);
+        const msgRes = await pool.query('SELECT * FROM messages WHERE id = $1', [msgId]);
+        if (msgRes.rows.length > 0) {
+            const msg = msgRes.rows[0];
+            const ipToBan = msg.ip;
+
+            const alreadyBanned = await pool.query('SELECT * FROM banned_users WHERE ip = $1', [ipToBan]);
+            if (alreadyBanned.rows.length === 0) {
+                
+                await pool.query('INSERT INTO banned_users (ip, reason, timestamp) VALUES ($1, $2, $3)', [ipToBan, reason, Date.now()]);
+                console.log(`IP Baneada: ${ipToBan} (Usuario: ${msg.user})`);
                 
                 // Desconectar inmediatamente
-                disconnectUserByIp(msg.ip, 'Has sido baneado permanentemente. Razón: ' + reason);
+                disconnectUserByIp(ipToBan, 'Has sido baneado permanentemente. Razón: ' + reason);
 
                 // Avisar en el chat
-                const sysMsg = { id: Date.now().toString(), user: 'SISTEMA', text: `El usuario ${msg.user} ha sido bloqueado. Razón: ${reason}`, isSystem: true, timestamp: Date.now() };
-                chatHistory.push(sysMsg); saveHistory(); io.emit('chat message', sysMsg);
+                const sysMsgData = { id: Date.now().toString(), user: 'SISTEMA', text: `El usuario ${msg.user} ha sido bloqueado. Razón: ${reason}`, isSystem: true, timestamp: Date.now() };
+                
+                await pool.query(
+                    'INSERT INTO messages (id, "user", text, ip, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
+                    [sysMsgData.id, sysMsgData.user, sysMsgData.text, null, true, sysMsgData.timestamp]
+                );
+                
+                io.emit('chat message', sysMsgData);
             }
         }
     });
 
     // Baneo Temporal (Actualizado para soportar Segundos/Minutos/Horas)
-    socket.on('admin temp ban', (data) => {
+    socket.on('admin temp ban', async (data) => {
         // data espera: { msgId, time, unit, reason }
-        // unit puede ser: 'seconds', 'minutes', 'hours'
-        const msg = chatHistory.find(m => m.id === data.msgId);
-        if (msg && msg.ip) {
+        const msgRes = await pool.query('SELECT * FROM messages WHERE id = $1', [data.msgId]);
+        
+        if (msgRes.rows.length > 0) {
+            const msg = msgRes.rows[0];
             let duration = 0;
             const timeVal = parseInt(data.time);
             
@@ -258,43 +285,67 @@ io.on('connection', (socket) => {
             else if (data.unit === 'hours') duration = timeVal * 60 * 60 * 1000;
             else duration = timeVal * 60 * 1000; // Default: minutos
 
-            tempBans[msg.ip] = Date.now() + duration;
-            saveTempBans();
+            const expiration = Date.now() + duration;
+
+            // Upsert (Insertar o Actualizar si existe)
+            await pool.query(`
+                INSERT INTO temp_bans (ip, reason, expiration) 
+                VALUES ($1, $2, $3)
+                ON CONFLICT (ip) 
+                DO UPDATE SET expiration = $3, reason = $2
+            `, [msg.ip, data.reason, expiration]);
             
             // Desconectar inmediatamente
             disconnectUserByIp(msg.ip, `Suspendido temporalmente por ${data.time} ${data.unit}. Razón: ${data.reason}`);
             
             // Avisar en el chat
-            const sysMsg = { 
+            const sysMsgData = { 
                 id: Date.now().toString(), 
                 user: 'SISTEMA', 
                 text: `El usuario ${msg.user} ha sido suspendido temporalmente (${data.time} ${data.unit}). Razón: ${data.reason}`, 
                 isSystem: true, 
                 timestamp: Date.now() 
             };
-            chatHistory.push(sysMsg); saveHistory(); io.emit('chat message', sysMsg);
+            
+            await pool.query(
+                'INSERT INTO messages (id, "user", text, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5)',
+                [sysMsgData.id, sysMsgData.user, sysMsgData.text, true, sysMsgData.timestamp]
+            );
+
+            io.emit('chat message', sysMsgData);
         }
     });
 
     // Reportar Mensaje (Nuevo)
-    socket.on('report message', (data) => {
+    socket.on('report message', async (data) => {
         // data = { id, reason }
-        const msg = chatHistory.find(m => m.id === data.id);
-        if (msg) {
+        const msgRes = await pool.query('SELECT * FROM messages WHERE id = $1', [data.id]);
+        if (msgRes.rows.length > 0) {
+            const msg = msgRes.rows[0];
+            // Reconstruimos el objeto mensaje para guardarlo en el JSON
+            const msgObj = {
+                id: msg.id, user: msg.user, text: msg.text, ip: msg.ip, isSystem: msg.isSystem, timestamp: parseInt(msg.timestamp)
+            };
+
             const report = {
                 id: Date.now().toString(),
-                reportedMsg: msg,
+                reportedMsg: msgObj,
                 reason: data.reason,
                 timestamp: Date.now(),
                 reporterIp: clientIp
             };
-            reports.push(report);
+            
+            await pool.query(
+                'INSERT INTO reports (id, "reportedMsg", reason, "reporterIp", timestamp) VALUES ($1, $2, $3, $4, $5)',
+                [report.id, report.reportedMsg, report.reason, report.reporterIp, report.timestamp]
+            );
+
             io.emit('new report', report); // Enviar alerta a los admins conectados
         }
     });
 
     // Enviar mensaje de Sistema
-    socket.on('admin system message', (text) => {
+    socket.on('admin system message', async (text) => {
         const msg = {
             id: Date.now().toString(),
             user: 'SISTEMA',
@@ -302,8 +353,12 @@ io.on('connection', (socket) => {
             isSystem: true, // Marca especial para estilos
             timestamp: Date.now()
         };
-        chatHistory.push(msg);
-        saveHistory(); // Guardar cambios
+        
+        await pool.query(
+            'INSERT INTO messages (id, "user", text, "isSystem", timestamp) VALUES ($1, $2, $3, $4, $5)',
+            [msg.id, msg.user, msg.text, true, msg.timestamp]
+        );
+        
         io.emit('chat message', msg);
     });
 
